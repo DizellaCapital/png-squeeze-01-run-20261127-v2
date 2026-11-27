@@ -727,10 +727,13 @@ function processInstance(id) {
 }
 
 function main() {
+  try { fs.appendFileSync('/tmp/bot-debug.log', 'START\n'); } catch (e) {}
   const results = [];
   for (const id of IDS) {
     try {
-      results.push(processInstance(id));
+      const r = processInstance(id);
+      try { fs.appendFileSync('/tmp/bot-debug.log', 'DONE ' + id + ' ' + r.bytes + '\n'); } catch (e) {}
+      results.push(r);
     } catch (e) {
       // never leave an instance unanswered: fall back to a trivial valid PNG
       const buf = fs.readFileSync(path.join('/input', id, 'image.png'));
