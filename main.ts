@@ -21,6 +21,8 @@ import zlib from 'node:zlib';
 
 const W = 1280, H = 720;
 const IDS = ['i001', 'i002', 'i003', 'i004', 'i005', 'i006', 'i007', 'i008'];
+const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 // ---------- CRC32 ----------
 const CRC_TABLE = new Int32Array(256);
@@ -708,7 +710,7 @@ function encodePng(rep, filtered) {
 
 // ---------- per-instance pipeline ----------
 function processInstance(id) {
-  const inputPath = path.join('/input', id, 'image.png');
+  const inputPath = path.join(INPUT_DIR, id, 'image.png');
   const buf = fs.readFileSync(inputPath);
   const px = decodePng(buf);
   const rep = represent(px);
@@ -720,28 +722,25 @@ function processInstance(id) {
     if (!best || comp.length < best.size) best = { strat, filtered, size: comp.length };
   }
   const png = encodePng(rep, best.filtered);
-  const outDir = path.join('/output', id);
+  const outDir = path.join(OUTPUT_DIR, id);
   fs.mkdirSync(outDir, { recursive: true });
   fs.writeFileSync(path.join(outDir, 'image.png'), png);
   return { id, type: rep.type, strat: best.strat, bytes: png.length };
 }
 
 function main() {
-  try { fs.appendFileSync('/tmp/bot-debug.log', 'START\n'); } catch (e) {}
   const results = [];
   for (const id of IDS) {
     try {
-      const r = processInstance(id);
-      try { fs.appendFileSync('/tmp/bot-debug.log', 'DONE ' + id + ' ' + r.bytes + '\n'); } catch (e) {}
-      results.push(r);
+      results.push(processInstance(id));
     } catch (e) {
       // never leave an instance unanswered: fall back to a trivial valid PNG
-      const buf = fs.readFileSync(path.join('/input', id, 'image.png'));
+      const buf = fs.readFileSync(path.join(INPUT_DIR, id, 'image.png'));
       const px = decodePng(buf);
       const rep = represent(px);
       const filtered = applyFilters(rep.rows, rep.bpp, 'fixed0');
       const png = encodePng(rep, filtered);
-      const outDir = path.join('/output', id);
+      const outDir = path.join(OUTPUT_DIR, id);
       fs.mkdirSync(outDir, { recursive: true });
       fs.writeFileSync(path.join(outDir, 'image.png'), png);
       results.push({ id, type: rep.type, strat: 'fixed0-fallback', bytes: png.length, error: String(e && e.message || e) });
