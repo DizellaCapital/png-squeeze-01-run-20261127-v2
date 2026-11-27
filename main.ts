@@ -338,11 +338,10 @@ class BitWriter {
 const HASH_BITS = 15, HASH_SIZE = 1 << HASH_BITS, HASH_MASK = HASH_SIZE - 1;
 const BLOCK_SIZE = 131072;
 const ITERS = 2;
-// Chain length: palette/grey data has few distinct 3-byte hashes, so the
-// longest matches hide deep in the chain (mc=1024 is worth it there and the
-// files are small); RGB/RGBA hashes are diverse, mc=256 captures nearly all
-// of the gain at much lower cost.
-function chainFor(bpp) { return bpp <= 2 ? 1024 : 256; }
+// Chain length: 1024 everywhere. Deep chains matter most for palette/grey
+// (few distinct hashes), but RGB/RGBA gain too (i007: 2.4%), and the
+// segment-based candidate extraction made the search fast enough to afford it.
+function chainFor(bpp) { return 1024; }
 
 function deflateOptimal(data, bpp) {
   const MAX_CHAIN = chainFor(bpp);
@@ -357,43 +356,61 @@ function deflateOptimal(data, bpp) {
   }
   const run = new Uint16Array(N + 1);
   for (let i = N - 1; i >= 0; i--) run[i] = (i + 1 < N && data[i] === data[i + 1]) ? Math.min(259, run[i + 1] + 1) : 1;
-  const matchLen = (i, dist) => {
-    const maxLen = Math.min(258, N - i);
-    const j = i - dist;
-    let len = 0;
-    const lim32 = maxLen - 3;
-    while (len < lim32) {
-      if (dv.getUint32(j + len, true) !== dv.getUint32(i + len, true)) break;
-      len += 4;
-    }
-    while (len < maxLen && data[j + len] === data[i + len]) len++;
-    return len;
-  };
-  const sublen = new Uint16Array(259);
+  // Range-top lengths: k where the length code changes (LEN_CODE[k] != LEN_CODE[k+1]),
+  // plus 258. Candidates are range tops and segment ends only.
+  const RANGE_TOPS = [];
+  for (let k = 3; k < 258; k++) if (LEN_CODE[k] !== LEN_CODE[k + 1]) RANGE_TOPS.push(k);
+  RANGE_TOPS.push(258);
+  // Segments of the sublen function: segs is a flat array [endLen, dist, ...]
+  // in increasing endLen order; segment j covers lengths (prevEnd+1 .. endLen),
+  // the first starting at 3. Recording segments instead of filling a 259-entry
+  // sublen array makes candidate extraction O(segments) instead of O(maxLen).
+  const segs = [];
   const findSublen = (i, capLen) => {
-    // NOTE: sublen[k] for k<=bestLen is always freshly written by the range
-    // fills below, so no fill(0) is needed (stale values above bestLen are
-    // never read).
-    if (i + 3 > N) return 0;
+    if (i + 3 > N) { segs.length = 0; return 0; }
+    const maxPossible = Math.min(258, N - i, capLen);
+    segs.length = 0;
     let bestLen = 0;
     if (i > 0 && data[i] === data[i - 1]) {
-      const rl = Math.min(run[i], 258, N - i, capLen);
+      const rl = Math.min(run[i], maxPossible);
       if (rl >= 3) {
-        for (let j = 3; j <= rl; j++) sublen[j] = 1;
+        segs.push(rl, 1);
         bestLen = rl;
-        if (rl >= Math.min(258, N - i, capLen)) return bestLen;
+        if (rl >= maxPossible) return bestLen;
       }
     }
     let cand = prev[i];
-    const maxPossible = Math.min(258, N - i, capLen);
     let chainLimit = MAX_CHAIN, tried = 0;
     while (cand >= 0 && tried++ < chainLimit) {
       const dist = i - cand;
       if (dist > 32768) break;
-      if (bestLen > 0 && data[cand + bestLen] !== data[i + bestLen]) { cand = prev[cand]; continue; }
-      const len = matchLen(i, dist);
+      if (bestLen === 0) {
+        // First verify the 3 bytes the hash promised (collisions exist):
+        // if they differ this candidate gives no match of length >= 3.
+        if (data[cand] !== data[i] || data[cand + 1] !== data[i + 1] || data[cand + 2] !== data[i + 2]) { cand = prev[cand]; continue; }
+        // Bytes 0..2 match. If byte 3 differs, the match is exactly 3 long:
+        // record it without a matchLen call.
+        if (data[cand + 3] !== data[i + 3]) {
+          segs.push(3, dist);
+          bestLen = 3;
+          cand = prev[cand];
+          continue;
+        }
+      } else if (data[cand + bestLen] !== data[i + bestLen]) { cand = prev[cand]; continue; }
+      // matchLen, inlined: longest match of data[i..] against data[cand..].
+      let len = 0;
+      {
+        const maxLen = Math.min(258, N - i);
+        const j = cand;
+        const lim32 = maxLen - 3;
+        while (len < lim32) {
+          if (dv.getUint32(j + len, true) !== dv.getUint32(i + len, true)) break;
+          len += 4;
+        }
+        while (len < maxLen && data[j + len] === data[i + len]) len++;
+      }
       if (len > bestLen) {
-        for (let j = bestLen + 1; j <= len; j++) sublen[j] = dist;
+        segs.push(len, dist);
         bestLen = len;
         if (len >= maxPossible) break;
         if (len >= 64) chainLimit = Math.min(chainLimit, tried + 8);
@@ -404,95 +421,23 @@ function deflateOptimal(data, bpp) {
     return bestLen;
   };
 
-  let pos = 0;
-  while (pos < N) {
-    const blockEnd = Math.min(N, pos + BLOCK_SIZE);
-    const isLast = blockEnd === N;
-    const blen = blockEnd - pos;
-    // Precompute match candidates once per block; reused across iterations.
-    const candOff = new Int32Array(blen + 1);
-    const candTmp = [];
-    for (let i = 0; i < blen; i++) {
-      const gi = pos + i;
-      const maxLen = findSublen(gi, blen - i);
-      candOff[i] = candTmp.length;
-      if (maxLen >= 3) {
-        for (let k = 3; k <= maxLen; k++) {
-          const d = sublen[k];
-          if (d === 0) continue;
-          const isTop = (k === maxLen) || (LEN_CODE[k] !== LEN_CODE[k + 1]);
-          const segTop = (k === maxLen) || (sublen[k + 1] !== d);
-          if (isTop || segTop) candTmp.push((k << 16) | d);
-        }
-      }
-    }
-    candOff[blen] = candTmp.length;
-    const candData = Int32Array.from(candTmp);
-    const cost = new Float64Array(blen + 1);
-    const choice = new Int32Array(blen + 1);
-    const litCost = new Float64Array(288);
-    const lenCost = new Float64Array(29);
-    const distCost = new Float64Array(30);
-    const setCosts = (ll, dl) => {
-      for (let i = 0; i < 288; i++) litCost[i] = ll[i] > 0 ? ll[i] : FIXED_LIT_LEN[i];
-      for (let c = 0; c < 29; c++) lenCost[c] = (ll[257 + c] > 0 ? ll[257 + c] : FIXED_LIT_LEN[257 + c]) + LEN_EXTRA[c];
-      for (let c = 0; c < 30; c++) distCost[c] = (dl[c] > 0 ? dl[c] : 5) + DIST_EXTRA[c];
-    };
-    setCosts(FIXED_LIT_LEN, FIXED_DIST_LEN);
-    let bestParse = null, bestSize = Infinity;
-    let parse = null;
-    for (let iter = 0; iter < ITERS; iter++) {
-      cost.fill(Infinity); cost[0] = 0;
-      for (let i = 0; i < blen; i++) {
-        const ci = cost[i];
-        if (ci === Infinity) continue;
-        const gi = pos + i;
-        const lc = ci + litCost[data[gi]];
-        if (lc < cost[i + 1]) { cost[i + 1] = lc; choice[i + 1] = data[gi]; }
-        if (i + 3 <= blen) {
-          for (let ci2 = candOff[i]; ci2 < candOff[i + 1]; ci2++) {
-            const m = candData[ci2];
-            const k = m >>> 16, d = m & 0xffff;
-            const cc = ci + lenCost[LEN_CODE[k]] + distCost[DIST_CODE[d]];
-            if (cc < cost[i + k]) { cost[i + k] = cc; choice[i + k] = (k << 16) | d; }
-          }
-        }
-      }
-      parse = [];
-      let i = blen;
-      while (i > 0) {
-        const ch = choice[i];
-        if (ch < 256) { parse.push(ch); i -= 1; }
-        else { parse.push((ch >>> 16) | ((ch & 0xffff) << 16)); i -= (ch >>> 16); }
-      }
-      parse.reverse();
-      parse.push(256);
-      const { lf, df, nLit, nDist } = parseFreqs(parse);
-      const ll2 = buildHuffman(lf.subarray(0, nLit), 15);
-      const dl2 = buildHuffman(df.subarray(0, nDist), 15);
-      const sizeEst = estimateSize(parse, lf, df, nLit, nDist, ll2, dl2);
-      if (sizeEst < bestSize) { bestSize = sizeEst; bestParse = parse; }
-      if (iter + 1 < ITERS) {
-        const fullLit = new Uint8Array(288); fullLit.set(ll2);
-        const fullDist = new Uint8Array(32); fullDist.set(dl2);
-        setCosts(fullLit, fullDist);
-      }
-    }
-    parse = bestParse;
-    const { lf, df, nLit, nDist } = parseFreqs(parse);
+  // Encode a token array (including its final EOB 256) as one DEFLATE block.
+  const writeBlock = (tokens, isLast) => {
+    const { lf, df, nLit, nDist } = parseFreqs(tokens);
     const litLengths = new Uint8Array(288); litLengths.set(buildHuffman(lf.subarray(0, nLit), 15));
     const distLengths = new Uint8Array(32); distLengths.set(buildHuffman(df.subarray(0, nDist), 15));
+    const dynSize = estimateSize(tokens, lf, df, nLit, nDist, litLengths, distLengths);
     let fixedBits = 3;
-    for (const t of parse) {
+    for (const t of tokens) {
       if (t < 256 || t === 256) fixedBits += FIXED_LIT_LEN[t];
       else { const L = t & 0xffff, D = t >>> 16; fixedBits += FIXED_LIT_LEN[257 + LEN_CODE[L]] + LEN_EXTRA[LEN_CODE[L]] + 5 + DIST_EXTRA[DIST_CODE[D]]; }
     }
-    if (Math.ceil(fixedBits / 8) < bestSize) {
+    if (Math.ceil(fixedBits / 8) < dynSize) {
       out.write(isLast ? 1 : 0, 1);
       out.write(1, 2);
       const litCodes = canonicalCodes(FIXED_LIT_LEN);
       const distCodes = canonicalCodes(FIXED_DIST_LEN);
-      for (const t of parse) {
+      for (const t of tokens) {
         if (t < 256 || t === 256) out.write(litCodes[t], FIXED_LIT_LEN[t]);
         else {
           const L = t & 0xffff, D = t >>> 16;
@@ -551,7 +496,7 @@ function deflateOptimal(data, bpp) {
         else if (s[0] === 17) out.write(s[1], 3);
         else if (s[0] === 18) out.write(s[1], 7);
       }
-      for (const t of parse) {
+      for (const t of tokens) {
         if (t < 256 || t === 256) out.write(litCodes[t], litLengths[t]);
         else {
           const L = t & 0xffff, D = t >>> 16;
@@ -564,6 +509,106 @@ function deflateOptimal(data, bpp) {
         }
       }
     }
+  };
+
+
+  let pos = 0;
+  while (pos < N) {
+    const blockEnd = Math.min(N, pos + BLOCK_SIZE);
+    const isLast = blockEnd === N;
+    const blen = blockEnd - pos;
+    // Precompute match candidates once per block; reused across iterations.
+    const candOff = new Int32Array(blen + 1);
+    let candData = new Int32Array(blen * 16);
+    let candLen = 0;
+    for (let i = 0; i < blen; i++) {
+      const gi = pos + i;
+      const maxLen = findSublen(gi, blen - i);
+      candOff[i] = candLen;
+      if (maxLen >= 3) {
+        let segStart = 3;
+        let rt = 0;
+        for (let s = 0; s < segs.length; s += 2) {
+          const endLen = segs[s], dist = segs[s + 1];
+          while (rt < RANGE_TOPS.length && RANGE_TOPS[rt] < segStart) rt++;
+          let lastTop = -1;
+          let k = rt;
+          while (k < RANGE_TOPS.length && RANGE_TOPS[k] <= endLen) {
+            if (candLen >= candData.length) {
+              const bigger = new Int32Array(candData.length * 2);
+              bigger.set(candData);
+              candData = bigger;
+            }
+            candData[candLen++] = (RANGE_TOPS[k] << 16) | dist;
+            lastTop = RANGE_TOPS[k];
+            k++;
+          }
+          if (lastTop !== endLen) {
+            if (candLen >= candData.length) {
+              const bigger = new Int32Array(candData.length * 2);
+              bigger.set(candData);
+              candData = bigger;
+            }
+            candData[candLen++] = (endLen << 16) | dist;
+          }
+          segStart = endLen + 1;
+        }
+      }
+    }
+    candOff[blen] = candLen;
+    candData = candData.subarray(0, candLen);
+    const cost = new Float64Array(blen + 1);
+    const choice = new Int32Array(blen + 1);
+    const litCost = new Float64Array(288);
+    const lenCost = new Float64Array(29);
+    const distCost = new Float64Array(30);
+    const setCosts = (ll, dl) => {
+      for (let i = 0; i < 288; i++) litCost[i] = ll[i] > 0 ? ll[i] : FIXED_LIT_LEN[i];
+      for (let c = 0; c < 29; c++) lenCost[c] = (ll[257 + c] > 0 ? ll[257 + c] : FIXED_LIT_LEN[257 + c]) + LEN_EXTRA[c];
+      for (let c = 0; c < 30; c++) distCost[c] = (dl[c] > 0 ? dl[c] : 5) + DIST_EXTRA[c];
+    };
+    setCosts(FIXED_LIT_LEN, FIXED_DIST_LEN);
+    let bestParse = null, bestSize = Infinity;
+    let parse = null;
+    for (let iter = 0; iter < ITERS; iter++) {
+      cost.fill(Infinity); cost[0] = 0;
+      for (let i = 0; i < blen; i++) {
+        const ci = cost[i];
+        if (ci === Infinity) continue;
+        const gi = pos + i;
+        const lc = ci + litCost[data[gi]];
+        if (lc < cost[i + 1]) { cost[i + 1] = lc; choice[i + 1] = data[gi]; }
+        if (i + 3 <= blen) {
+          for (let ci2 = candOff[i]; ci2 < candOff[i + 1]; ci2++) {
+            const m = candData[ci2];
+            const k = m >>> 16, d = m & 0xffff;
+            const cc = ci + lenCost[LEN_CODE[k]] + distCost[DIST_CODE[d]];
+            if (cc < cost[i + k]) { cost[i + k] = cc; choice[i + k] = (k << 16) | d; }
+          }
+        }
+      }
+      parse = [];
+      let i = blen;
+      while (i > 0) {
+        const ch = choice[i];
+        if (ch < 256) { parse.push(ch); i -= 1; }
+        else { parse.push((ch >>> 16) | ((ch & 0xffff) << 16)); i -= (ch >>> 16); }
+      }
+      parse.reverse();
+      parse.push(256);
+      const { lf, df, nLit, nDist } = parseFreqs(parse);
+      const ll2 = buildHuffman(lf.subarray(0, nLit), 15);
+      const dl2 = buildHuffman(df.subarray(0, nDist), 15);
+      const sizeEst = estimateSize(parse, lf, df, nLit, nDist, ll2, dl2);
+      if (sizeEst < bestSize) { bestSize = sizeEst; bestParse = parse; }
+      if (iter + 1 < ITERS) {
+        const fullLit = new Uint8Array(288); fullLit.set(ll2);
+        const fullDist = new Uint8Array(32); fullDist.set(dl2);
+        setCosts(fullLit, fullDist);
+      }
+    }
+    parse = bestParse;
+    writeBlock(parse, isLast);
     pos = blockEnd;
   }
   out.align();
